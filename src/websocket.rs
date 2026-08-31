@@ -64,6 +64,10 @@ impl Source for EmptyStream {
     }
 }
 
+type ServerMidHandshake = tungstenite::handshake::MidHandshake<
+    tungstenite::ServerHandshake<Box<dyn Stream>, tungstenite::handshake::server::NoCallback>,
+>;
+
 #[derive(Debug)]
 enum WebSocketError {
     Io(std::io::Error),
@@ -141,6 +145,7 @@ enum WebSocketMessage {
 
 enum WebSocketState {
     Unconnected(UnconnectedState),
+    Handshaking(HandshakingState),
     Connected(ConnectedState),
     Closed(WebSocket<Box<dyn Stream>>),
 }
@@ -149,6 +154,11 @@ impl WebSocketState {
     fn next_state(&mut self, message: WebSocketMessage) -> Result<(), WebSocketError> {
         match self {
             WebSocketState::Unconnected(state) => *self = state.next_state(message)?,
+            WebSocketState::Handshaking(state) => {
+                if let Some(state) = state.next_state(message)? {
+                    *self = state;
+                }
+            }
             WebSocketState::Connected(state) => {
                 if let Some(state) = state.next_state(message)? {
                     *self = state;
@@ -166,18 +176,84 @@ struct UnconnectedState;
 impl UnconnectedState {
     fn next_state(&mut self, message: WebSocketMessage) -> Result<WebSocketState, WebSocketError> {
         match message {
-            WebSocketMessage::UpgradeWebSocket(stream) => {
-                Ok(WebSocketState::Connected(ConnectedState {
-                    websocket: tungstenite::accept(stream)?,
+            WebSocketMessage::UpgradeWebSocket(stream) => match tungstenite::accept(stream) {
+                Ok(websocket) => Ok(WebSocketState::Connected(ConnectedState {
+                    websocket,
                     messages: VecDeque::new(),
                     write: WriteState::Unwritable,
-                }))
-            }
+                })),
+                // The handshake could not complete in a single call on the
+                // non-blocking socket. Keep it and resume on later readiness
+                // events instead of treating the interruption as fatal.
+                Err(tungstenite::HandshakeError::Interrupted(handshake)) => {
+                    Ok(WebSocketState::Handshaking(HandshakingState {
+                        handshake: Some(handshake),
+                    }))
+                }
+                // A malformed or aborted handshake (for example a probe
+                // connection that sends no data) affects only this connection
+                // and must not crash the server. Drop just this connection.
+                Err(tungstenite::HandshakeError::Failure(_)) => Ok(WebSocketState::Closed(
+                    WebSocket::from_raw_socket(Box::new(EmptyStream), Role::Server, None),
+                )),
+            },
             WebSocketMessage::MessagesAvailable => {
                 panic!("messages available on an unconnected WebSocket")
             }
             WebSocketMessage::CanWrite => panic!("writable event on an unconnected WebSocket"),
             WebSocketMessage::SendText(_) => panic!("text sent on an unconnected WebSocket"),
+        }
+    }
+}
+
+struct HandshakingState {
+    handshake: Option<ServerMidHandshake>,
+}
+
+impl HandshakingState {
+    fn next_state(
+        &mut self,
+        message: WebSocketMessage,
+    ) -> Result<Option<WebSocketState>, WebSocketError> {
+        match message {
+            // A WebSocket handshake over a non-blocking socket can span several
+            // readiness events. Both readable and writable events drive it
+            // forward: the client request is read, then the response is written.
+            WebSocketMessage::MessagesAvailable | WebSocketMessage::CanWrite => {
+                let handshake = self
+                    .handshake
+                    .take()
+                    .expect("handshake should be in progress");
+                match handshake.handshake() {
+                    Ok(websocket) => Ok(Some(WebSocketState::Connected(ConnectedState {
+                        websocket,
+                        messages: VecDeque::new(),
+                        write: WriteState::Unwritable,
+                    }))),
+                    // Still incomplete: keep the handshake and wait for the next
+                    // readiness event to resume it.
+                    Err(tungstenite::HandshakeError::Interrupted(handshake)) => {
+                        self.handshake = Some(handshake);
+                        Ok(None)
+                    }
+                    // A malformed or aborted handshake affects only this
+                    // connection. The stream is consumed and closed by the
+                    // failed handshake, so an empty stream stands in for the
+                    // subsequent deregister step.
+                    Err(tungstenite::HandshakeError::Failure(_)) => {
+                        Ok(Some(WebSocketState::Closed(WebSocket::from_raw_socket(
+                            Box::new(EmptyStream),
+                            Role::Server,
+                            None,
+                        ))))
+                    }
+                }
+            }
+            WebSocketMessage::UpgradeWebSocket(_) => {
+                panic!("connection is already being upgraded to a WebSocket")
+            }
+            // The client cannot receive broadcasts until the handshake completes.
+            WebSocketMessage::SendText(_) => Ok(None),
         }
     }
 }
@@ -431,15 +507,19 @@ impl Server {
                                         // There is no guarantee that another
                                         // readiness event will be delivered
                                         // until the readiness event has been
-                                        // drained
-                                        state
-                                            .next_state(WebSocketMessage::MessagesAvailable)
-                                            .unwrap_or_else(|e| {
-                                                panic!(
-                                                    "failed to read messages on WebSocket: {:?}",
-                                                    e
-                                                )
-                                            });
+                                        // drained. The handshake may still be in
+                                        // progress here; a failed one is already
+                                        // closed and must not be driven further.
+                                        if !matches!(state, WebSocketState::Closed(_)) {
+                                            state
+                                                .next_state(WebSocketMessage::MessagesAvailable)
+                                                .unwrap_or_else(|e| {
+                                                    panic!(
+                                                        "failed to read messages on WebSocket: {:?}",
+                                                        e
+                                                    )
+                                                });
+                                        }
                                         if let WebSocketState::Closed(mut stream) = state {
                                             poll.registry()
                                                 .deregister(stream.get_mut())
